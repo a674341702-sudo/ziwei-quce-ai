@@ -1,5 +1,9 @@
 import { NextRequest } from 'next/server';
-import type { ZiweiChart, Palace, Star } from '@/lib/ziwei/types';
+import type { ZiweiChart, Palace, Star, SiHua } from '@/lib/ziwei/types';
+import { detectPatterns } from '@/lib/ziwei/patterns';
+import { getDaXianSiHua, getSiHuaByStem } from '@/lib/ziwei/sihua';
+
+export const runtime = 'nodejs';
 
 const palaceRoles: Record<string, string> = {
   命宫: '性格底色、行动方式与人生方向',
@@ -34,15 +38,8 @@ const starTraits: Record<string, string> = {
 };
 
 const brightnessNotes: Record<string, string> = {
-  庙: '传统亮度标记为庙，通常视为该星特质较容易发挥',
-  旺: '传统亮度标记为旺，通常视为该星特质较有表现空间',
-  得: '传统亮度标记为得，通常视为该星特质有一定发挥条件',
-  利: '传统亮度标记为利，需结合会照星曜观察',
-  平: '传统亮度标记为平，表现较依赖环境与个人选择',
-  不: '传统亮度标记为不，宜留意该星特质的压力面',
-  闲: '传统亮度标记为闲，单星作用不宜过度放大',
-  陷: '传统亮度标记为陷，传统上较强调该星特质的调整课题',
-  地: '传统亮度标记为地，宜结合全盘结构谨慎判断',
+  庙: '庙', 旺: '旺', 得: '得', 利: '利', 平: '平',
+  不: '不', 闲: '闲', 陷: '陷', 地: '地',
 };
 
 const topics = [
@@ -57,178 +54,181 @@ function findPalace(chart: ZiweiChart, name: string) {
   return chart.palaces.find(p => p.name === name);
 }
 
-function getStars(palace?: Palace) {
-  if (!palace) return '未找到相关宫位资料';
+function findPalaceByBranch(chart: ZiweiChart, branch: number) {
+  return chart.palaces.find(p => p.branch === ((branch % 12) + 12) % 12);
+}
 
+function getStars(palace?: Palace): string {
+  if (!palace) return '未找到相关宫位资料';
   const stars = palace.stars ?? [];
+  const majorStars = stars.filter(s => s.type === 'major');
+  const borrowed = palace.borrowedStars?.length
+    ? '；空宫借对宫主星参考：' + palace.borrowedStars.join('、')
+    : '';
 
   if (!stars.length) {
     return palace.borrowedStars?.length
-      ? '空宫，借对宫主星：' + palace.borrowedStars.join('、') + '；需连同对宫结构一起判断'
+      ? '空宫；借对宫主星：' + palace.borrowedStars.join('、') + '，需连同对宫结构判断'
       : '空宫；需参考对宫借星，不宜只凭空宫作结论';
   }
 
-  return stars.map((s: Star) => {
-    const kind =
-      s.type === 'major' ? '主星' :
-      s.type === 'lucky' ? '吉曜' :
-      s.type === 'sha' ? '煞曜' : '辅曜';
-
-    const hua = s.siHua ? '，生年四化标记为化' + s.siHua : '';
-    const bright = s.brightnessRaw
-      ? '；' + (brightnessNotes[s.brightnessRaw] || ('亮度：' + s.brightnessRaw))
-      : '';
-    const trait =
-      s.type === 'major' && starTraits[s.name]
-        ? '。星性参考：' + starTraits[s.name]
-        : '';
-
-    return kind + '：' + s.name + hua + bright + trait;
-  }).join('\n');
+  const lines = stars.map((s: Star) => {
+    const kind = s.type === 'major' ? '主星' : s.type === 'lucky' ? '吉曜' : s.type === 'sha' ? '煞曜' : '辅曜';
+    const bright = s.brightnessRaw ? '（亮度：' + (brightnessNotes[s.brightnessRaw] || s.brightnessRaw) + '）' : '';
+    const trait = s.type === 'major' && starTraits[s.name] ? '；星性参考：' + starTraits[s.name] : '';
+    return kind + '：' + s.name + bright + trait;
+  });
+  if (!majorStars.length && palace.borrowedStars?.length) lines.push('空宫借对宫主星：' + palace.borrowedStars.join('、'));
+  return lines.join('\n') + borrowed;
 }
 
 function palaceLine(palace?: Palace) {
   if (!palace) return '宫位资料暂缺';
-  return palace.name + '：' + getStars(palace);
+  return palace.name + '（地支' + palace.branch + '，宫干索引' + palace.stem + '）：' + getStars(palace);
 }
 
-// 三方四正：目标宫、地支相隔四位的两宫，以及对宫。
-function fourPalaces(chart: ZiweiChart, targetName: string) {
-  const target = findPalace(chart, targetName);
+function fourPalacesByBranch(chart: ZiweiChart, branch: number): string[] {
+  const branches = [branch, (branch + 4) % 12, (branch + 8) % 12, (branch + 6) % 12];
+  const labels = ['本宫', '三合宫一', '三合宫二', '对宫'];
+  return branches.map((b, i) => {
+    const p = findPalaceByBranch(chart, b);
+    return labels[i] + '：' + palaceLine(p);
+  });
+}
 
-  if (!target) return [targetName + '：宫位资料暂缺'];
-
-  const branches = [
-    target.branch,
-    (target.branch + 4) % 12,
-    (target.branch + 8) % 12,
-    (target.branch + 6) % 12,
+function resolveRequestedPalace(chart: ZiweiChart, prompt: string): string | undefined {
+  const patterns = [
+    /落在【([^】]+)】/,
+    /重点分析【([^】]+)】/,
+    /分析【([^】]+)】/,
   ];
+  for (const re of patterns) {
+    const match = prompt.match(re);
+    if (match?.[1] && findPalace(chart, match[1])) return match[1];
+  }
+  return undefined;
+}
 
-  const result: string[] = [];
-  const seen = new Set<number>();
-
-  for (const branch of branches) {
-    const palace = chart.palaces.find(p => p.branch === branch);
-
-    if (palace && !seen.has(branch)) {
-      seen.add(branch);
-      result.push(palaceLine(palace));
-    }
+function nativeSiHuaAnalysis(chart: ZiweiChart): string {
+  const stem = chart.lunarInfo?.yearStem;
+  if (!Number.isInteger(stem) || stem < 0 || stem > 9) return '出生年天干资料不完整，暂时无法计算本命生年四化。';
+  const transforms = getSiHuaByStem(stem);
+  const labels: SiHua[] = ['禄', '权', '科', '忌'];
+  const lines = labels.map(type => {
+    const starName = transforms[type];
+    const palace = chart.palaces.find(p => (p.stars ?? []).some(s => s.name === starName));
+    return '生年化' + type + '：' + starName + (palace ? '落在' + palace.name : '（命盘中未找到该星落宫资料）');
+  });
+  const self = chart.palaces.flatMap(p =>
+    (p.selfSihua ?? []).map(mark => p.name + '宫宫干自化' + mark.starName + '化' + mark.siHua)
+  );
+  lines.push(self.length
+    ? '宫干自化标记：' + self.join('；')
+    : '当前命盘资料未提供宫干自化标记。');
+  return lines.join('\n') + '\n四化要结合星曜所在宫位、三方四正和行运层次合看，不能只凭某一化曜断定事件必然发生。';
+}
+function currentDaXianAnalysis(chart: ZiweiChart): { text: string; palace?: Palace; index: number } {
+  const index = chart.currentDaXianIndex;
+  if (!Number.isInteger(index) || index < 0 || index >= (chart.daXians?.length ?? 0)) {
+    return {
+      text: '当前年龄为' + (chart.currentAge ?? '暂缺') + '岁；当前大限索引未指向有效的十年大限。可能处于童限或排盘资料未覆盖的年龄段，因此不强行套用第一步大限。',
+      index: -1,
+    };
   }
 
-  return result;
+  const dx = chart.daXians[index];
+  const palace = findPalaceByBranch(chart, dx.palaceBranch);
+  if (!palace) {
+    return { text: dx.startAge + '至' + dx.endAge + '岁大限，行运宫位为' + dx.palaceName + '，但对应宫位资料暂缺。', index };
+  }
+
+  const siHua = getDaXianSiHua(chart, index);
+  const transforms = siHua?.transforms;
+  const huaText = transforms
+    ? '大限宫干为' + siHua.stemName + '，大限四化：化禄' + transforms.禄 + '、化权' + transforms.权 + '、化科' + transforms.科 + '、化忌' + transforms.忌 + '。'
+    : '大限宫干四化暂时无法计算。';
+
+  return {
+    text: dx.startAge + '至' + dx.endAge + '岁，当前行运宫位为' + dx.palaceName + '。\n' +
+      '大限宫位星曜：' + getStars(palace) + '\n' + huaText +
+      '\n大限宫位三方四正：\n' + fourPalacesByBranch(chart, palace.branch).join('\n'),
+    palace,
+    index,
+  };
 }
 
-function currentDaXian(chart: ZiweiChart) {
-  const d = chart.daXians?.[chart.currentDaXianIndex];
+function patternAnalysis(chart: ZiweiChart): string {
+  const patterns = detectPatterns(chart);
+  if (!patterns.length) {
+    return '格局识别模块未发现达到当前规则条件的已定义格局。此结果不代表命盘没有特点，只表示本次规则没有匹配到对应组合。';
+  }
 
-  if (!d) return '当前大限资料暂未提供。';
-
-  const hua = d.siHua
-    ? '该大限四化：化禄' + d.siHua.lu +
-      '、化权' + d.siHua.quan +
-      '、化科' + d.siHua.ke +
-      '、化忌' + d.siHua.ji + '。'
-    : '当前大限四化资料暂缺。';
-
-  return d.startAge + '至' + d.endAge +
-    '岁，行运宫位为' + d.palaceName + '。' +
-    hua +
-    '应把大限宫位与本命相关宫位交叉观察，不宜把大限单独当成吉凶结论。';
+  return patterns.slice(0, 8).map((p, i) => {
+    const conditions = p.conditions?.required?.length
+      ? '\n成立依据：' + p.conditions.required.join('；')
+      : '';
+    const bonus = p.conditions?.bonus?.length
+      ? '\n加分条件：' + p.conditions.bonus.join('；')
+      : '';
+    const breaking = p.conditions?.breaking?.length
+      ? '\n需留意：' + p.conditions.breaking.join('；')
+      : '';
+    const source = p.source ? '\n传统资料标注：' + p.source : '';
+    return (i + 1) + '. ' + p.name + '（' + p.level + '）\n' +
+      p.description + conditions + bonus + breaking + source;
+  }).join('\n\n');
 }
 
-function siHuaAnalysis(chart: ZiweiChart) {
-  const birth = chart.palaces.flatMap(p =>
-    (p.stars ?? [])
-      .filter(s => s.siHua)
-      .map(s => p.name + '的' + s.name + '化' + s.siHua)
-  );
-
-  const self = chart.palaces.flatMap(p =>
-    (p.selfSihua ?? [])
-      .map(mark => p.name + '宫干自化' + mark.starName + '化' + mark.siHua)
-  );
-
-  return [
-    birth.length
-      ? '生年四化星曜标记：' + birth.join('；') + '。'
-      : '排盘资料中没有读取到生年四化星曜标记。',
-    self.length
-      ? '宫干自化资料：' + self.join('；') + '。'
-      : '排盘资料中没有读取到宫干自化标记。',
-    '四化需结合星曜所在宫位、对宫及行运层次理解；单独出现某一化曜，不足以断定事件必然发生。',
-  ].join('\n');
-}
-
-function analyze(chart: ZiweiChart, prompt: string) {
-  const topic = topics.find(t =>
-    t.words.some(w => prompt.includes(w))
-  );
-
-  const mainPalace = topic ? topic.palace : '命宫';
-  const title = topic ? topic.title : '命格整体分析';
+function analyze(chart: ZiweiChart, prompt: string): string {
+  const topic = topics.find(t => t.words.some(w => prompt.includes(w)));
+  const requestedPalace = resolveRequestedPalace(chart, prompt);
+  const mainPalace = requestedPalace || (topic ? topic.palace : '命宫');
+  const title = requestedPalace ? mainPalace + '专项分析' : topic ? topic.title : '命格整体分析';
   const main = findPalace(chart, mainPalace);
-
   const mainStars = main?.stars?.filter(s => s.type === 'major') ?? [];
-  const traits = mainStars
-    .map(s => starTraits[s.name])
-    .filter(Boolean);
-
-  const selfMarks = main?.selfSihua ?? [];
-  const focus = topic
-    ? topic.focus
-    : '先天个性、人生方向、资源配置与环境互动';
+  const traits = mainStars.map(s => starTraits[s.name]).filter(Boolean);
+  const focus = topic?.focus || (requestedPalace ? (palaceRoles[mainPalace] || '该宫位对应的人生主题') : '先天个性、人生方向、资源配置与环境互动');
+  const dx = currentDaXianAnalysis(chart);
 
   const suggestions: Record<string, string> = {
-    夫妻宫: '可把沟通方式、金钱观、生活节奏和冲突处理方式作为现实相处观察点；不宜凭单一星曜判断婚姻成败。',
-    官禄宫: '先明确优势技能、可持续投入的行业和阶段目标，再用小成本实践验证方向；重大转型需评估现金流与风险。',
+    夫妻宫: '把沟通方式、金钱观、生活节奏和冲突处理作为现实相处观察点；不宜凭单一星曜判断婚姻成败。',
+    官禄宫: '明确优势技能、可持续投入的行业和阶段目标，再用小成本实践验证方向；重大转型需评估现金流与风险。',
     财帛宫: '区分稳定收入、弹性收入与高风险收入，建立预算、储蓄和应急资金；命盘不能判断投资收益或借贷安全。',
-    疾厄宫: '可关注作息、压力与生活习惯；紫微斗数不能诊断疾病，如有不适应咨询正规医疗机构。',
+    疾厄宫: '关注作息、压力与生活习惯；紫微斗数不能诊断疾病，如有不适应咨询正规医疗机构。',
     命宫: '把星曜特质当作自我观察的假设，结合真实经历验证；将优势转成可执行习惯，比单纯贴性格标签更有帮助。',
   };
 
   const lines = [
     '**【' + title + '】**',
     '本次重点：' + focus + '。',
-    '以下内容依据当前命盘结构，以传统紫微斗数概念作文化性、参考性解读，不代表确定命运，也不保证现实事件发生。',
+    '以下内容依据当前命盘数据和传统紫微斗数规则作文化性、参考性解读，不代表确定命运，也不保证现实事件发生。',
     '',
     '**【一、核心宫位与星曜】**',
     mainPalace + '主要对应：' + (palaceRoles[mainPalace] || '相关人生主题') + '。',
-    getStars(main),
-    traits.length
-      ? '主星组合提示：' + traits.join(' ')
-      : '主星资料不足，暂不对主星组合做强结论。',
-    selfMarks.length
-      ? '本宫自化：' + selfMarks.map(m => m.starName + '化' + m.siHua).join('、') + '。需结合星曜与对宫理解。'
-      : '',
+    palaceLine(main),
+    traits.length ? '主星组合提示：' + traits.join(' ') : '主星资料不足，暂不对主星组合做强结论。',
     '',
     '**【二、三方四正联动】**',
-    fourPalaces(chart, mainPalace).join('\n'),
-    '观察重点：主宫反映主题本身，三合宫补充资源与行动条件，对宫呈现外部环境及互动面。四宫信息需要合看，不能只用一颗星定论。',
+    fourPalacesByBranch(chart, main?.branch ?? chart.mingGongBranch).join('\n'),
+    '判断方法：本宫看主题本身，两个三合宫补充资源与行动条件，对宫观察外部环境及互动面。四宫需要合看，不以单颗星曜直接定吉凶。',
     '',
-    '**【三、四化与自化】**',
-    siHuaAnalysis(chart),
+    '**【三、本命格局识别】**',
+    patternAnalysis(chart),
     '',
-    '**【四、当前大限】**',
+    '**【四、生年四化与宫干自化】**',
+    nativeSiHuaAnalysis(chart),
+    '',
+    '**【五、当前十年大限】**',
     '当前年龄：' + (chart.currentAge ?? '暂缺') + '岁。',
-    currentDaXian(chart),
+    dx.text,
     '',
-    '**【五、命盘基础资料】**',
-    '五行局：' + (chart.wuxingJuName || '暂缺') +
-      '；命主：' + (chart.mingZhu || '暂缺') +
-      '；身主：' + (chart.shenZhu || '暂缺') +
-      '；身宫地支：' + (chart.shenGongBranch ?? '暂缺') + '。',
-    '',
-    '**【六、可执行的现实建议】**',
-    suggestions[mainPalace] ||
-      '建议把命盘中的倾向转化为具体、可观察的行动目标，并结合现实条件持续调整。',
-    '资料不足的部分应保留，不宜凭空补断。',
+    '**【六、现实建议】**',
+    suggestions[mainPalace] || '把命盘中的倾向转化为具体、可观察的行动目标，并结合现实条件持续调整。',
+    '资料不足的部分保留为未知，不凭空补断。',
     '',
     '**说明**',
-    '本内容为规则型传统文化解读，不是人工智能模型生成的专业咨询，也不构成医疗、投资、法律或婚恋决策建议。',
+    '本内容为规则型传统文化解读，并非大语言模型生成的个性化专业咨询；不构成医疗、投资、法律或婚恋决策建议。'
   ];
-
   return lines.filter(Boolean).join('\n');
 }
 
@@ -236,44 +236,25 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const chart = body.chart as ZiweiChart | undefined;
-    const messages = body.messages as Array<{
-      role: string;
-      content: string;
-    }> | undefined;
+    const messages = body.messages as Array<{ role: string; content: string }> | undefined;
 
-    if (!chart || !Array.isArray(chart.palaces)) {
-      return Response.json(
-        { error: '命盘数据不完整' },
-        { status: 400 }
-      );
+    if (!chart || !Array.isArray(chart.palaces) || !chart.lunarInfo) {
+      return Response.json({ error: '命盘数据不完整' }, { status: 400 });
     }
 
-    const prompt =
-      messages && messages.length
-        ? messages[messages.length - 1].content
-        : '命格总览';
-
+    const prompt = messages && messages.length
+      ? String(messages[messages.length - 1]?.content ?? '')
+      : '命格总览';
     const result = analyze(chart, prompt || '命格总览');
 
     const stream = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
         const chunks = result.match(/.{1,30}/gu) ?? [result];
-
         for (const chunk of chunks) {
-          controller.enqueue(
-            encoder.encode(
-              'data: ' +
-              JSON.stringify({ delta: { text: chunk } }) +
-              '\n\n'
-            )
-          );
+          controller.enqueue(encoder.encode('data: ' + JSON.stringify({ delta: { text: chunk } }) + '\n\n'));
         }
-
-        controller.enqueue(
-          encoder.encode('data: [DONE]\n\n')
-        );
-
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
         controller.close();
       },
     });
@@ -287,10 +268,6 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error('紫微解读接口错误:', error);
-
-    return Response.json(
-      { error: '解读生成失败' },
-      { status: 500 }
-    );
+    return Response.json({ error: '解读生成失败' }, { status: 500 });
   }
 }
